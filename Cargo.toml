@@ -1,0 +1,8 @@
+[package]
+name = "duplex"
+version = "0.1.0"
+authors = ["Ze'ev Klapow <zklapow@gmail.com>"]
+
+[dependencies]
+log = "0.3"
+env_logger = "0.3"
