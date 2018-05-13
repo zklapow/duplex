@@ -22,7 +22,7 @@ use env_logger::LogBuilder;
 use clap::{Arg, App, SubCommand, AppSettings};
 use chrono::prelude::*;
 
-fn main() {
+fn main() -> Result<(), Error> {
     init_logging();
 
     info!("Hello, world!");
@@ -40,13 +40,13 @@ fn main() {
                 .default_value("localhost:8081")))
         .get_matches();
 
-    let res = match matches.subcommand() {
+    match matches.subcommand() {
         ("proxy", Some(m)) => {
             proxy::proxy(m.value_of("from").unwrap(), m.value_of("to").unwrap());
             Ok(())
         }
         _ => Err(Error::new(ErrorKind::InvalidInput, "unknown command"))
-    };
+    }
 }
 
 fn init_logging() {

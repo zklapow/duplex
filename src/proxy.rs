@@ -1,18 +1,22 @@
-use std::io;
+use futures::{Future, Stream};
 use std::error::Error;
-use std::sync::{Arc, Mutex};
-use std::cell::RefCell;
+use std::io;
+use std::mem;
 use std::net::{Shutdown, SocketAddr};
-
-use tokio_core::reactor::Core;
+use std::sync::{Arc, Mutex};
 use tokio_core::net::{TcpListener, TcpStream};
+use tokio_core::reactor::Core;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::io::{copy, shutdown};
 use tokio_io::io::{ReadHalf, WriteHalf};
-use futures::{Stream, Future};
+
+enum SocketStatus {
+    Ready(ReadHalf<TcpStream>, WriteHalf<TcpStream>),
+    InUse,
+}
 
 struct Proxy {
-    inner: Arc<Mutex<(Option<ReadHalf<TcpStream>>, Option<WriteHalf<TcpStream>>)>>
+    inner: Arc<Mutex<SocketStatus>>
 }
 
 pub fn proxy(listen_addr: &str, server_addr: &str) {
@@ -35,36 +39,45 @@ pub fn proxy(listen_addr: &str, server_addr: &str) {
     let done = server.and_then(move |server| {
         trace!("Server connection established!");
         let (pread, pwrite) = server.split();
-        let proxy = Proxy{ inner: Arc::new(Mutex::new((Option::Some(pread), Option::Some(pwrite)))) };
-        //let (server_reader, server_writer) = server.split();
+        let proxy = Proxy { inner: Arc::new(Mutex::new(SocketStatus::Ready(pread, pwrite))) };
 
         socket.incoming().for_each(move |(client, client_addr)| {
-            trace!("Connection accepted from {}", client_addr);
+            info!("Connection accepted from {}", client_addr);
 
-            let (client_reader, client_writer) = client.split();
             let lock = proxy.inner.clone();
 
-            let res = lock.try_lock().map(|mut gaurd| {
-                let (ref mut boxed_reader, ref mut boxed_writer) = *gaurd;
-                let client_to_server = copy(client_reader, boxed_writer.take().unwrap()).map(|(n, _, _)| n);
-                let server_to_client = copy(boxed_reader.take().unwrap(), client_writer).map(|(n, _, _)| n);
+            let mut state = lock.lock().expect("Could not lock socket state");
+            let owned_socket_state = mem::replace(&mut *state, SocketStatus::InUse);
 
-                let res = client_to_server.join(server_to_client);
+            match owned_socket_state {
+                SocketStatus::Ready(read, write) => {
+                    let (client_reader, client_writer) = client.split();
+                    let client_to_server = copy(client_reader, write)
+                        .map(|(n, _, _)| n);
+                    let server_to_client = copy(read, client_writer)
+                        .map(|(n, _, _)| n);
 
-                res.map(move |(from_client, from_server)| {
-                    debug!("Connection closes got {} bytes from client and {} bytes from server", from_client, from_server);
-                }).map_err(|e| {
-                    error!("Got error handling connection: {}", e);
-                })
-            });
+                    let f = client_to_server.select(server_to_client)
+                        .map(|_| {
+                            info!("Connection finished");
+                        })
+                        .map_err(|(err, _)| {
+                            error!("Connection error {:?}", err);
+                        });
 
-            match res {
-                Ok(f) => {
-                    handle.spawn(f);
-                    Ok(())
-                },
-                Err(e) => Err(io::Error::new(io::ErrorKind::WouldBlock, e.description()))
+                    handle.spawn(f)
+                }
+                SocketStatus::InUse => {
+                    handle.spawn_fn(move || {
+                        client.shutdown(Shutdown::Both)
+                            .map(|_|())
+                            .map_err(|_| ())
+                        //Ok(())
+                    })
+                }
             }
+
+            Ok(())
         })
     });
 
